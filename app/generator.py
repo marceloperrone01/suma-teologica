@@ -1,5 +1,5 @@
-"""LLM-side generation: prompts the configured Claude model with retrieved
-context and produces a devotional/meditative answer with canonical citations.
+"""LLM-side generation: routes between Claude (Anthropic) and OpenAI backends,
+with retrieved context, devotional prompt, and canonical citations.
 """
 
 from __future__ import annotations
@@ -8,11 +8,21 @@ import os
 from dataclasses import dataclass
 from typing import Iterable
 
-from anthropic import Anthropic
-
+from app.meditation import MEDITATION_SYSTEM_PROMPT, MEDITATION_USER_TEMPLATE, respondeo_or_fallback
 from app.retriever import RetrievedChunk
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
+
+CLAUDE_MODELS = {
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+    "claude-opus-4-7",
+}
+OPENAI_MODELS = {
+    "gpt-4.1",
+    "gpt-4o",
+    "gpt-4o-mini",
+}
 
 SYSTEM_PROMPT = """Você é um companheiro de leitura da Suma Teológica de Santo Tomás de Aquino, em sua tradução para o português. Seu propósito é auxiliar o usuário em leitura DEVOCIONAL e meditativa — não acadêmica fria.
 
@@ -38,6 +48,7 @@ Formato da resposta:
 class GenResult:
     text: str
     model: str
+    backend: str  # "anthropic" | "openai"
     input_tokens: int
     output_tokens: int
     cache_read_tokens: int = 0
@@ -45,7 +56,6 @@ class GenResult:
 
 
 def format_context(chunks: Iterable[RetrievedChunk]) -> str:
-    """Format retrieved chunks into a structured context block for the LLM."""
     blocks: list[str] = []
     for i, c in enumerate(chunks, start=1):
         secao_label = _label_secao(c.secao)
@@ -73,13 +83,109 @@ def _label_secao(secao: str) -> str:
     return label_map.get(base, secao)
 
 
-_client_cache: dict[str, Anthropic] = {}
+_anthropic_client = None
+_openai_client = None
 
 
-def _client() -> Anthropic:
-    if "default" not in _client_cache:
-        _client_cache["default"] = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    return _client_cache["default"]
+def _anthropic():
+    global _anthropic_client
+    if _anthropic_client is None:
+        from anthropic import Anthropic
+        _anthropic_client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    return _anthropic_client
+
+
+def _openai():
+    global _openai_client
+    if _openai_client is None:
+        from openai import OpenAI
+        _openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    return _openai_client
+
+
+def backend_for(model: str) -> str:
+    if model in CLAUDE_MODELS or model.startswith("claude"):
+        return "anthropic"
+    if model in OPENAI_MODELS or model.startswith("gpt"):
+        return "openai"
+    raise ValueError(f"Unknown model: {model}")
+
+
+def _call(
+    system_prompt: str,
+    user_content: str,
+    model: str,
+    history: list[dict],
+    max_tokens: int,
+) -> GenResult:
+    backend = backend_for(model)
+    if backend == "anthropic":
+        return _call_anthropic(system_prompt, user_content, model, history, max_tokens)
+    return _call_openai(system_prompt, user_content, model, history, max_tokens)
+
+
+def _call_anthropic(
+    system_prompt: str,
+    user_content: str,
+    model: str,
+    history: list[dict],
+    max_tokens: int,
+) -> GenResult:
+    client = _anthropic()
+    messages: list[dict] = list(history)
+    messages.append({"role": "user", "content": user_content})
+    resp = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=[
+            {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
+        ],
+        messages=messages,
+    )
+    text = "".join(b.text for b in resp.content if b.type == "text")
+    u = resp.usage
+    return GenResult(
+        text=text,
+        model=model,
+        backend="anthropic",
+        input_tokens=u.input_tokens,
+        output_tokens=u.output_tokens,
+        cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
+        cache_creation_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
+    )
+
+
+def _call_openai(
+    system_prompt: str,
+    user_content: str,
+    model: str,
+    history: list[dict],
+    max_tokens: int,
+) -> GenResult:
+    client = _openai()
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_content})
+    resp = client.chat.completions.create(
+        model=model,
+        max_tokens=max_tokens,
+        messages=messages,
+    )
+    text = resp.choices[0].message.content or ""
+    u = resp.usage
+    cached = 0
+    details = getattr(u, "prompt_tokens_details", None)
+    if details is not None:
+        cached = getattr(details, "cached_tokens", 0) or 0
+    return GenResult(
+        text=text,
+        model=model,
+        backend="openai",
+        input_tokens=u.prompt_tokens,
+        output_tokens=u.completion_tokens,
+        cache_read_tokens=cached,
+        cache_creation_tokens=0,
+    )
 
 
 def answer(
@@ -89,43 +195,18 @@ def answer(
     history: list[dict] | None = None,
     max_tokens: int = 1024,
 ) -> GenResult:
-    """Generate a devotional answer grounded in the retrieved chunks.
-
-    The system prompt is sent with a cache_control breakpoint so the SDK
-    will cache it across turns (saving tokens in multi-turn sessions).
-    """
-    client = _client()
+    """Q&A grounded in retrieved chunks, with devotional aplicação at the end."""
     context = format_context(chunks)
+    user_content = f"Pergunta: {question}\n\nPassagens recuperadas:\n\n{context}"
+    return _call(SYSTEM_PROMPT, user_content, model, history or [], max_tokens)
 
-    user_content = (
-        f"Pergunta: {question}\n\n"
-        f"Passagens recuperadas:\n\n{context}"
-    )
 
-    messages: list[dict] = []
-    if history:
-        messages.extend(history)
-    messages.append({"role": "user", "content": user_content})
-
-    resp = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=[
-            {
-                "type": "text",
-                "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=messages,
+def paraphrase(article: dict, model: str = DEFAULT_MODEL, max_tokens: int = 700) -> GenResult:
+    """Contemplative paraphrase of an article (uses respondeo when available)."""
+    user_content = MEDITATION_USER_TEMPLATE.format(
+        citacao=article["citacao"],
+        titulo_questao=article["titulo_questao"],
+        titulo_artigo=article["titulo_artigo"],
+        texto=respondeo_or_fallback(article),
     )
-    text = "".join(block.text for block in resp.content if block.type == "text")
-    usage = resp.usage
-    return GenResult(
-        text=text,
-        model=model,
-        input_tokens=usage.input_tokens,
-        output_tokens=usage.output_tokens,
-        cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
-        cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
-    )
+    return _call(MEDITATION_SYSTEM_PROMPT, user_content, model, [], max_tokens)

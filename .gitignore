@@ -6,5 +6,7 @@ __pycache__/
 data/chroma/
 data/extracted.txt
 data/chunks.jsonl
+data/bm25.pkl
+data/store.sqlite
 .claude/scheduled_tasks.lock
 log.txt
