@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -23,7 +23,7 @@ CHUNKS_JSONL = ROOT / "data" / "chunks.jsonl"
 
 # Approx tokens-per-char for Portuguese ≈ 0.25 (4 chars/token).
 # We target ~800 tokens / chunk = ~3200 chars.
-MAX_CHARS = 3200
+MAX_CHARS = 12800
 OVERLAP_CHARS = 320
 
 
@@ -41,7 +41,9 @@ class Chunk:
     sub_idx: int = 0
 
 
-def split_long(text: str, max_chars: int = MAX_CHARS, overlap: int = OVERLAP_CHARS) -> list[str]:
+def split_long(
+    text: str, max_chars: int = MAX_CHARS, overlap: int = OVERLAP_CHARS
+) -> list[str]:
     if len(text) <= max_chars:
         return [text]
     parts: list[str] = []
@@ -95,7 +97,9 @@ def make_chunks(art: dict) -> list[Chunk]:
     # Summary chunk: title + respondeo (or raw_body if no respondeo)
     summary_body = art.get("respondeo") or art.get("raw_body", "")
     if summary_body:
-        summary = f"{art['titulo_questao']} — {art['titulo_artigo']}\n\n{summary_body[:1500]}"
+        summary = (
+            f"{art['titulo_questao']} — {art['titulo_artigo']}\n\n{summary_body[:1500]}"
+        )
         add("resumo", summary)
 
     # Fallback for fully unstructured articles: emit raw_body as a single chunk
