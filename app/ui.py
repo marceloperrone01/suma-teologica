@@ -11,6 +11,10 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
+import sys  # noqa: E402
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from app.generator import DEFAULT_MODEL, answer  # noqa: E402
 from app.retriever import dedupe_by_article, search  # noqa: E402
 

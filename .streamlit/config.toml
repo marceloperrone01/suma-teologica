@@ -1,0 +1,10 @@
+[server]
+# Desabilita o file watcher do hot-reload.
+# Evita os centenas de "ModuleNotFoundError: No module named 'torchvision'"
+# gerados quando o Streamlit tenta introspectar os image processors do
+# transformers (que precisam de torchvision, não instalado nem necessário).
+fileWatcherType = "none"
+
+[browser]
+# Não abre o navegador automaticamente
+gatherUsageStats = false

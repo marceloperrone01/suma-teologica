@@ -7,3 +7,4 @@ data/chroma/
 data/extracted.txt
 data/chunks.jsonl
 .claude/scheduled_tasks.lock
+log.txt
