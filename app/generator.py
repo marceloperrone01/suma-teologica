@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from app.meditation import MEDITATION_SYSTEM_PROMPT, MEDITATION_USER_TEMPLATE, respondeo_or_fallback
-from app.retriever import RetrievedChunk
+from app.retriever import RetrievedChunk, TccChunk
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
@@ -199,6 +199,47 @@ def answer(
     context = format_context(chunks)
     user_content = f"Pergunta: {question}\n\nPassagens recuperadas:\n\n{context}"
     return _call(SYSTEM_PROMPT, user_content, model, history or [], max_tokens)
+
+
+TCC_SYSTEM_PROMPT = """Você é um assistente de pesquisa acadêmica especializado em psicologia clínica, psicoterapia e ansiedade social. Seu propósito é responder perguntas com base EXCLUSIVAMENTE nos artigos científicos fornecidos como contexto.
+
+Diretrizes invioláveis:
+1. Baseie-se EXCLUSIVAMENTE nas passagens fornecidas como contexto. Não invente dados, resultados ou afirmações.
+2. Toda afirmação extraída de um artigo deve vir com sua referência entre colchetes: [Morina et al., 2022], [Krafft et al., 2020], etc. Use a citação exata fornecida nos metadados.
+3. Diferencie claramente entre resultados empíricos ("o estudo encontrou que…") e afirmações teóricas dos autores.
+4. Se as passagens fornecidas não respondem à pergunta, diga isso honestamente — não fabrique conteúdo.
+5. Tom: acadêmico, objetivo, preciso. Sem parágrafo devocional ou de aplicação pessoal.
+
+Formato da resposta:
+- Síntese direta dos achados relevantes, com citações entre colchetes.
+- Se múltiplos artigos divergem, aponte a divergência explicitamente.
+- Mantenha resposta concisa e informativa.
+"""
+
+
+def format_context_tcc(chunks: Iterable[TccChunk]) -> str:
+    blocks: list[str] = []
+    for i, c in enumerate(chunks, start=1):
+        blocks.append(
+            f"[Passagem {i}]\n"
+            f"Referência: {c.citacao} (seção: {c.section})\n"
+            f"Título: {c.titulo}\n"
+            f"Texto:\n{c.text.strip()}"
+        )
+    return "\n\n---\n\n".join(blocks)
+
+
+def answer_tcc(
+    question: str,
+    chunks: list[TccChunk],
+    model: str = DEFAULT_MODEL,
+    history: list[dict] | None = None,
+    max_tokens: int = 1024,
+) -> GenResult:
+    """Academic Q&A grounded in TCC research paper chunks."""
+    context = format_context_tcc(chunks)
+    user_content = f"Pergunta: {question}\n\nPassagens recuperadas:\n\n{context}"
+    return _call(TCC_SYSTEM_PROMPT, user_content, model, history or [], max_tokens)
 
 
 def paraphrase(article: dict, model: str = DEFAULT_MODEL, max_tokens: int = 700) -> GenResult:

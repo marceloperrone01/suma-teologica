@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     started_at TEXT NOT NULL,
     last_at TEXT NOT NULL,
     model TEXT NOT NULL,
-    title TEXT
+    title TEXT,
+    dataset TEXT NOT NULL DEFAULT 'suma'
 );
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,6 +53,7 @@ class Conversation:
     last_at: str
     model: str
     title: str | None
+    dataset: str = "suma"
 
 
 @dataclass
@@ -74,6 +76,12 @@ def connect():
     try:
         if not _initialized:
             conn.executescript(SCHEMA)
+            # Migrate existing databases that predate the dataset column.
+            try:
+                conn.execute("ALTER TABLE conversations ADD COLUMN dataset TEXT NOT NULL DEFAULT 'suma'")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # Column already exists
             _initialized = True
         yield conn
         conn.commit()
@@ -85,12 +93,12 @@ def _now() -> str:
     return datetime.utcnow().isoformat(timespec="seconds")
 
 
-def create_conversation(model: str, title: str | None = None) -> int:
+def create_conversation(model: str, title: str | None = None, dataset: str = "suma") -> int:
     with _lock, connect() as c:
         now = _now()
         cur = c.execute(
-            "INSERT INTO conversations(started_at, last_at, model, title) VALUES (?, ?, ?, ?)",
-            (now, now, model, title),
+            "INSERT INTO conversations(started_at, last_at, model, title, dataset) VALUES (?, ?, ?, ?, ?)",
+            (now, now, model, title, dataset),
         )
         return cur.lastrowid
 
@@ -129,7 +137,7 @@ def add_message(
 def list_conversations(limit: int = 50) -> list[Conversation]:
     with connect() as c:
         rows = c.execute(
-            "SELECT id, started_at, last_at, model, title FROM conversations "
+            "SELECT id, started_at, last_at, model, title, dataset FROM conversations "
             "ORDER BY last_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -139,7 +147,7 @@ def list_conversations(limit: int = 50) -> list[Conversation]:
 def get_conversation(conversation_id: int) -> Conversation | None:
     with connect() as c:
         row = c.execute(
-            "SELECT id, started_at, last_at, model, title FROM conversations WHERE id = ?",
+            "SELECT id, started_at, last_at, model, title, dataset FROM conversations WHERE id = ?",
             (conversation_id,),
         ).fetchone()
         return Conversation(**dict(row)) if row else None

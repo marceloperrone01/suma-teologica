@@ -15,13 +15,21 @@ Decisões já confirmadas com o usuário:
 ## Arquitetura
 
 ```
-PDF → extração → parser escolástico → chunks (com metadados) → embeddings bge-m3
-                                                                       ↓
-                                                                  ChromaDB (local)
-                                                                       ↓
+                 ┌─ Suma Teológica ─────────────────────────────────┐
+                 │  PDF → pdftotext → parser escolástico             │
+                 │  → chunks.jsonl → bge-m3 → ChromaDB "suma_chunks" │
+                 │  → bm25.pkl                                       │
+                 └───────────────────────────────────────────────────┘
+                 ┌─ TCC ─────────────────────────────────────────────┐
+                 │  tcc/*.pdf + .docx → tcc_parser → tcc_articles     │
+                 │  → tcc_chunker → tcc_chunks.jsonl                  │
+                 │  → bge-m3 → ChromaDB "tcc_chunks"                 │
+                 │  → tcc_bm25.pkl                                    │
+                 └───────────────────────────────────────────────────┘
+                                     ↓ dataset="suma"|"tcc"
 Streamlit UI ←→ retriever (híbrido BM25+denso) ←→ rerank ←→ Claude/OpenAI (gerador)
-        ↑                                                              ↓
-        └────────── SQLite (histórico + meditação do dia) ←────────────┘
+     ↑  [seletor acervo]                                              ↓
+     └────────── SQLite (conversas.dataset, mensagens, meditações) ←──┘
 ```
 
 ### Stack
@@ -42,61 +50,115 @@ Streamlit UI ←→ retriever (híbrido BM25+denso) ←→ rerank ←→ Claude/
 
 ```
 suma-teologica/
-├── suma-teolc3b3gica.pdf          # já existe
+├── suma-teolc3b3gica.pdf          # PDF original
+├── tcc/                           # PDFs e DOCX dos artigos científicos (TCC)
 ├── data/
-│   ├── extracted.txt              # saída de pdftotext
-│   ├── articles.jsonl             # 1 linha por Artigo parseado, com seções
-│   ├── chunks.jsonl               # chunks com metadados
-│   └── chroma/                    # índice ChromaDB persistente
+│   ├── extracted.txt              # texto bruto da Suma (pdftotext)
+│   ├── articles.jsonl             # 2.686 artigos estruturados
+│   ├── chunks.jsonl               # ~25k chunks escolásticos
+│   ├── bm25.pkl                   # índice BM25 da Suma
+│   ├── chroma/                    # ChromaDB (suma_chunks + tcc_chunks)
+│   ├── store.sqlite               # conversas, mensagens, meditações
+│   └── tcc/
+│       ├── tcc_articles.jsonl     # 11 documentos extraídos
+│       ├── tcc_chunks.jsonl       # 186 chunks acadêmicos
+│       └── tcc_bm25.pkl           # índice BM25 do TCC
 ├── app/
-│   ├── ingest.py                  # pipeline: PDF → chunks → embeddings → Chroma
-│   ├── parser.py                  # regex que detecta Parte/Questão/Artigo/seções
-│   ├── chunker.py                 # chunking respeitando fronteiras de seção
-│   ├── retriever.py               # busca híbrida BM25+denso, filtros por metadado
-│   ├── generator.py               # roteador Claude/OpenAI com prompt template
-│   ├── store.py                   # SQLite (histórico, meditação diária)
-│   └── ui.py                      # Streamlit
-├── .env.example                   # ANTHROPIC_API_KEY, OPENAI_API_KEY
+│   ├── parser.py                  # extracted.txt → articles.jsonl
+│   ├── chunker.py                 # articles.jsonl → chunks.jsonl (estrutura escolástica)
+│   ├── ingest.py                  # chunks.jsonl → ChromaDB "suma_chunks"
+│   ├── bm25_index.py              # chunks.jsonl → bm25.pkl
+│   ├── tcc_parser.py              # tcc/*.pdf + .docx → tcc_articles.jsonl
+│   ├── tcc_chunker.py             # tcc_articles.jsonl → tcc_chunks.jsonl
+│   ├── tcc_ingest.py              # tcc_chunks.jsonl → ChromaDB "tcc_chunks"
+│   ├── tcc_bm25.py                # tcc_chunks.jsonl → tcc_bm25.pkl
+│   ├── retriever.py               # busca densa/BM25/híbrida, param dataset=
+│   ├── generator.py               # answer() devocional + answer_tcc() acadêmico
+│   ├── meditation.py              # artigo do dia + paráfrase contemplativa
+│   ├── store.py                   # SQLite (conversas.dataset, mensagens, meditações)
+│   ├── ui.py                      # Streamlit: seletor acervo + chat
+│   └── pages/
+│       └── 2_📖_Meditação_do_dia.py
+├── .env.example
 ├── requirements.txt
 └── README.md
 ```
 
-## Pipeline de indexação (rodar uma vez)
+## Pipeline de indexação
 
-1. **Extrair texto**: `pdftotext -layout suma-teolc3b3gica.pdf data/extracted.txt`.
-2. **Parsear estrutura** (`app/parser.py`):
-   - Detectar Parte (I, I-II, II-II, III, Suplemento) — provavelmente por cabeçalho ou range de páginas; inspecionar o sumário (páginas iniciais já analisadas) para mapear.
-   - `^Questão (\d+):\s*(.+)$` → abre nova Questão.
-   - `^Art\.\s*(\d+)\s*[—-]\s*(.+)$` → abre novo Artigo.
-   - Dentro de cada Artigo, segmentar em campos:
-     - `objeções`: bloco até `Mas, em contrário` (split por `^\d+\.\s` ou `^\d+\.\s*Demais\.\s*—`).
-     - `sed_contra`: do `Mas, em contrário` até `SOLUÇÃO. —`.
-     - `respondeo`: do `SOLUÇÃO. —` até a primeira `RESPOSTA À PRIMEIRA.`.
-     - `respostas_obj`: lista de respostas a partir de `RESPOSTA À PRIMEIRA./SEGUNDA./TERCEIRA./...`.
-   - Saída: `articles.jsonl`, um objeto por Artigo:
-     ```json
-     {
-       "parte": "I", "questao": 13, "artigo": 2,
-       "titulo_questao": "Dos nomes de Deus",
-       "titulo_artigo": "Se algum nome se predica de Deus substancialmente",
-       "citacao": "ST I, q.13, a.2",
-       "secoes": {
-         "objecoes": ["...", "...", "..."],
-         "sed_contra": "...",
-         "respondeo": "...",
-         "respostas_objecoes": ["...", "...", "..."]
-       },
-       "pagina_pdf": 200
-     }
-     ```
-3. **Chunking** (`app/chunker.py`):
-   - **Unidade primária = seção do Artigo** (objeção individual, sed contra, respondeo, resposta individual). Cada seção vira 1 chunk com metadado completo de citação.
-   - Se uma seção exceder ~800 tokens (raro), partir em sub-chunks com overlap de ~80 tokens, preservando `citacao` + `secao` + `sub_idx`.
-   - Adicionar um chunk-resumo por Artigo contendo `titulo_questao + titulo_artigo + respondeo` (para queries amplas).
-4. **Embeddings + indexação**:
-   - Carregar `bge-m3` em GPU (FP16); batch size 32; tempo estimado para ~30-50k chunks: 10-20 minutos na RTX 4050.
-   - Persistir em ChromaDB com `collection.add(documents, embeddings, metadatas, ids)`. Metadados: `parte`, `questao`, `artigo`, `secao`, `citacao`, `pagina_pdf`.
-5. **Índice BM25 paralelo**: `rank_bm25.BM25Okapi` serializado em `data/bm25.pkl` (tokenização simples lowercase + remoção de stopwords PT).
+### Suma Teológica (rodar uma vez)
+
+```bash
+pdftotext -layout suma-teolc3b3gica.pdf data/extracted.txt   # ~2 min
+python -m app.parser       # extracted.txt → data/articles.jsonl       (~30s)
+python -m app.chunker      # articles.jsonl → data/chunks.jsonl
+python -m app.ingest       # chunks.jsonl → ChromaDB "suma_chunks"      (~15 min RTX 4050)
+python -m app.bm25_index   # chunks.jsonl → data/bm25.pkl               (~5s)
+```
+
+**Detalhes da Suma:**
+
+1. **`app/parser.py`** — detecta estrutura escolástica via regex:
+   - `^Questão (\d+):\s*(.+)$` → abre nova Questão
+   - `^Art\.\s*(\d+)\s*[—-]\s*(.+)$` → abre novo Artigo
+   - Segmentos: objeções (`^\d+\.\s`), sed contra (`Mas, em contrário`), respondeo (`SOLUÇÃO. —`), respostas (`RESPOSTA À PRIMEIRA./…`)
+   - Saída: 2.686 artigos em `articles.jsonl` com campos `parte`, `questao`, `artigo`, `citacao`, `objecoes`, `sed_contra`, `respondeo`, `respostas_objecoes`
+
+2. **`app/chunker.py`** — unidade primária = seção do Artigo:
+   - 1 chunk por objeção, sed contra, respondeo, resposta + 1 chunk-resumo por Artigo
+   - Seções > 12.800 chars partidas com overlap de 320 chars
+   - Chunk ID: `{parte}|q{questao}|a{artigo}|{secao}|{sub_idx}`
+
+3. **`app/ingest.py`** — embeddings + ChromaDB:
+   - Modelo: `BAAI/bge-m3` (CUDA FP16, ~2.3 GB VRAM, batch 32)
+   - Coleção: `suma_chunks`, métrica cosine
+   - Metadata indexada: `parte`, `questao`, `artigo`, `secao`, `citacao`, `titulo_questao`, `titulo_artigo`
+   - Suporte a `--recreate` e retomada incremental
+
+4. **`app/bm25_index.py`** — índice lexical:
+   - `BM25Okapi` sobre todos os chunks, tokenizador PT (strip accents + stopwords)
+   - Serializado em `data/bm25.pkl`
+
+---
+
+### TCC (rodar uma vez; repetir ao adicionar documentos)
+
+Coloque os PDFs e/ou arquivos `.docx` na pasta `tcc/` e rode:
+
+```bash
+python -m app.tcc_parser    # tcc/*.pdf + *.docx → data/tcc/tcc_articles.jsonl
+python -m app.tcc_chunker   # tcc_articles.jsonl → data/tcc/tcc_chunks.jsonl
+python -m app.tcc_ingest    # tcc_chunks.jsonl → ChromaDB "tcc_chunks"    (~1 min RTX 4050)
+python -m app.tcc_bm25      # tcc_chunks.jsonl → data/tcc/tcc_bm25.pkl    (~5s)
+```
+
+> Para reindexar do zero: `python -m app.tcc_ingest --recreate`
+
+**Detalhes do TCC:**
+
+1. **`app/tcc_parser.py`** — extração genérica de documentos acadêmicos:
+   - PDFs: `pdftotext` via subprocess (sem `-layout`, melhor para papers multi-coluna)
+   - DOCX: `python-docx`
+   - Heurística de título: primeiro bloco de texto antes de "Abstract"
+   - Heurística de citação: regex de autor+ano no início do documento → `"Morina et al., 2022"`
+   - Saída: `tcc_articles.jsonl` com campos `source_file`, `title`, `citacao`, `full_text`
+
+2. **`app/tcc_chunker.py`** — chunking por seção acadêmica:
+   - Detecta headings via regex: `ABSTRACT`, `INTRODUCTION`, `METHODS`, `RESULTS`, `DISCUSSION`, `CONCLUSION`, etc.
+   - Para antes de `REFERENCES` (evita ruído de citações bibliográficas)
+   - Mesmos parâmetros da Suma: MAX_CHARS = 3.200, OVERLAP = 320
+   - Sliding window garante avanço mínimo de `MAX_CHARS - OVERLAP` por passo (evita loop)
+   - Chunk ID: `{doc_id}|{section}|{sub_idx}`
+   - Metadata: `doc_id`, `source_file`, `section`, `titulo`, `citacao`
+
+3. **`app/tcc_ingest.py`** — mesmo pipeline de embeddings da Suma:
+   - Modelo compartilhado `BAAI/bge-m3`
+   - Coleção: `tcc_chunks` (mesmo ChromaDB, coleção separada)
+
+4. **`app/tcc_bm25.py`** — índice BM25 com stopwords PT + EN (papers em inglês):
+   - Serializado em `data/tcc/tcc_bm25.pkl`
+
+**Estatísticas atuais do TCC:** 11 documentos (10 PDFs + 1 DOCX), 186 chunks únicos.
 
 ## Pipeline de consulta
 
@@ -160,8 +222,9 @@ suma-teologica/
 5. **Meditação diária**: abrir a página, conferir que o artigo do dia muda corretamente entre dias diferentes (forçar via parâmetro `?date=`).
 6. **Histórico**: enviar 3 mensagens, fechar o app, reabrir, confirmar que a conversa anterior aparece na sidebar e pode ser retomada.
 
-## Fases sugeridas de execução
+## Fases de execução
 
-- **Fase 1 (MVP)**: extração + parser + chunking + embeddings + Chroma + retrieval denso + UI Streamlit chat com Claude apenas. Sem BM25, sem rerank, sem extras.
-- **Fase 2**: adicionar OpenAI + seletor, busca híbrida BM25, citações canônicas no prompt.
-- **Fase 3**: meditação diária + histórico persistente + (opcional) reranker.
+- **Fase 1 (MVP)**: extração + parser + chunking + embeddings + Chroma + retrieval denso + UI Streamlit chat com Claude apenas. ✅
+- **Fase 2**: OpenAI + seletor, busca híbrida BM25 (RRF), citações canônicas realçadas na UI. ✅
+- **Fase 3**: meditação diária, histórico persistente em SQLite, reranker bge-reranker-v2-m3. ✅
+- **Fase 4**: segunda coleção TCC (PDFs acadêmicos), pipeline de ingestão genérico, seletor de acervo na UI, system prompt acadêmico separado. ✅

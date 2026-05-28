@@ -19,10 +19,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app import store  # noqa: E402
-from app.generator import DEFAULT_MODEL, answer, backend_for  # noqa: E402
+from app.generator import DEFAULT_MODEL, answer, answer_tcc, backend_for  # noqa: E402
 from app.retriever import (  # noqa: E402
     RetrievedChunk,
+    TccChunk,
     dedupe_by_article,
+    dedupe_by_source,
     hybrid_search,
     rerank,
     search,
@@ -70,16 +72,20 @@ def _missing_key_for(model: str) -> str | None:
     return None
 
 
-def _chunks_to_dicts(chunks: list[RetrievedChunk]) -> list[dict]:
+def _chunks_to_dicts(chunks: list) -> list[dict]:
     return [asdict(c) for c in chunks]
 
 
-def _dicts_to_chunks(dicts: list[dict]) -> list[RetrievedChunk]:
+def _dicts_to_chunks(dicts: list[dict], dataset: str = "suma") -> list:
+    if dataset == "tcc":
+        return [TccChunk(**d) for d in dicts]
     return [RetrievedChunk(**d) for d in dicts]
 
 
 def _load_conversation(conv_id: int) -> None:
     """Restore a conversation from SQLite into st.session_state."""
+    conv = store.get_conversation(conv_id)
+    dataset = conv.dataset if conv else "suma"
     msgs = store.get_messages(conv_id)
     st.session_state.messages = [
         {
@@ -91,14 +97,15 @@ def _load_conversation(conv_id: int) -> None:
     ]
     last_with_sources = next((m for m in reversed(st.session_state.messages) if m.get("sources")), None)
     if last_with_sources:
-        st.session_state["last_sources"] = _dicts_to_chunks(last_with_sources["sources"])
+        st.session_state["last_sources"] = _dicts_to_chunks(last_with_sources["sources"], dataset)
     else:
         st.session_state.pop("last_sources", None)
     st.session_state["conversation_id"] = conv_id
+    st.session_state["active_dataset"] = dataset
 
 
-def _new_conversation(model: str) -> int:
-    conv_id = store.create_conversation(model=model)
+def _new_conversation(model: str, dataset: str = "suma") -> int:
+    conv_id = store.create_conversation(model=model, dataset=dataset)
     st.session_state.messages = []
     st.session_state["conversation_id"] = conv_id
     st.session_state.pop("last_sources", None)
@@ -106,24 +113,44 @@ def _new_conversation(model: str) -> int:
     return conv_id
 
 
-st.set_page_config(page_title="Suma Teológica — Leitura Devocional", layout="wide")
-st.title("📜 Suma Teológica — Leitura Devocional")
-st.caption("RAG sobre a Suma Teológica de Santo Tomás de Aquino. Embeddings locais (bge-m3) + Claude/OpenAI.")
+st.set_page_config(page_title="Biblioteca Teológica & TCC", layout="wide")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 with st.sidebar:
     st.header("Configurações")
+
+    dataset_label = st.radio(
+        "Acervo",
+        options=["📜 Suma Teológica", "🎓 TCC"],
+        horizontal=True,
+        help="Selecione qual base de conhecimento consultar.",
+    )
+    dataset_key = "suma" if "Suma" in dataset_label else "tcc"
+
+    # Reset session when switching datasets to avoid cross-collection context
+    if st.session_state.get("active_dataset") != dataset_key:
+        st.session_state["active_dataset"] = dataset_key
+        st.session_state.messages = []
+        st.session_state.pop("conversation_id", None)
+        st.session_state.pop("last_sources", None)
+        st.session_state.pop("last_usage", None)
+
     model = st.selectbox(
         "Modelo",
         options=MODELS,
         index=MODELS.index(DEFAULT_MODEL) if DEFAULT_MODEL in MODELS else 0,
         help="Claude usa prompt caching; OpenAI usa prefix caching automático.",
     )
-    parte_filter = st.selectbox("Filtrar por Parte", PARTS, index=0)
+
+    if dataset_key == "suma":
+        parte_filter = st.selectbox("Filtrar por Parte", PARTS, index=0)
+    else:
+        parte_filter = None
+
     top_k = st.slider("Passagens recuperadas (top-k)", min_value=4, max_value=16, value=8)
-    max_per_article = st.slider("Máx. chunks por artigo", min_value=1, max_value=4, value=2)
+    max_per_article = st.slider("Máx. chunks por fonte", min_value=1, max_value=4, value=2)
     hybrid = st.toggle(
         "Busca híbrida (denso + BM25)",
         value=True,
@@ -143,19 +170,20 @@ with st.sidebar:
     st.divider()
     st.subheader("Conversas")
     if st.button("➕ Nova conversa", use_container_width=True):
-        _new_conversation(model)
+        _new_conversation(model, dataset=dataset_key)
         st.rerun()
 
     convs = store.list_conversations(limit=30)
     current_id = st.session_state.get("conversation_id")
     for conv in convs:
+        badge = "📜" if getattr(conv, "dataset", "suma") == "suma" else "🎓"
         label = conv.title or f"Conversa #{conv.id}"
-        if len(label) > 40:
-            label = label[:37] + "…"
+        if len(label) > 38:
+            label = label[:35] + "…"
         prefix = "▶ " if conv.id == current_id else "  "
         col_a, col_b = st.columns([4, 1])
         with col_a:
-            if st.button(f"{prefix}{label}", key=f"conv_{conv.id}", use_container_width=True):
+            if st.button(f"{prefix}{badge} {label}", key=f"conv_{conv.id}", use_container_width=True):
                 _load_conversation(conv.id)
                 st.rerun()
         with col_b:
@@ -165,6 +193,18 @@ with st.sidebar:
                     st.session_state.pop("conversation_id", None)
                     st.session_state.messages = []
                 st.rerun()
+
+if dataset_key == "suma":
+    st.title("📜 Suma Teológica — Leitura Devocional")
+    st.caption("RAG sobre a Suma Teológica de Santo Tomás de Aquino. Embeddings locais (bge-m3) + Claude/OpenAI.")
+    _chat_placeholder = "Faça uma pergunta sobre a Suma…"
+    _spinner_msg = "Buscando passagens e meditando…"
+else:
+    st.title("🎓 TCC — Pesquisa em Psicoterapia")
+    st.caption("RAG sobre artigos científicos de psicologia clínica, TCC/ACT e ansiedade social. Embeddings locais (bge-m3) + Claude/OpenAI.")
+    _chat_placeholder = "Faça uma pergunta sobre os artigos do TCC…"
+    _spinner_msg = "Buscando passagens nos artigos…"
+
 
 def _copy_button(content: str, key: str) -> None:
     """Render a popover that exposes the raw markdown with a built-in copy button."""
@@ -183,13 +223,13 @@ with main_col:
             else:
                 st.markdown(msg["content"])
 
-    if prompt := st.chat_input("Faça uma pergunta sobre a Suma…"):
+    if prompt := st.chat_input(_chat_placeholder):
         if _missing_key_for(model):
             st.stop()
         conv_id = st.session_state.get("conversation_id")
         if conv_id is None:
             title = prompt[:80] + ("…" if len(prompt) > 80 else "")
-            conv_id = store.create_conversation(model=model, title=title)
+            conv_id = store.create_conversation(model=model, title=title, dataset=dataset_key)
             st.session_state["conversation_id"] = conv_id
         elif not st.session_state.messages:
             title = prompt[:80] + ("…" if len(prompt) > 80 else "")
@@ -201,15 +241,19 @@ with main_col:
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("Buscando passagens e meditando…"):
-                where: dict | None = {"parte": parte_filter} if parte_filter != "(todas)" else None
+            with st.spinner(_spinner_msg):
+                where: dict | None = None
+                if dataset_key == "suma" and parte_filter and parte_filter != "(todas)":
+                    where = {"parte": parte_filter}
                 retrieve = hybrid_search if hybrid else search
-                # When reranking, fetch a wider pool (3× top_k) before rerank trims.
                 fetch_k = top_k * 3 if use_rerank else top_k * 2
-                raw = retrieve(prompt, top_k=fetch_k, where=where)
+                raw = retrieve(prompt, top_k=fetch_k, where=where, dataset=dataset_key)
                 if use_rerank:
                     raw = rerank(prompt, raw, top_k=top_k * 2)
-                chunks = dedupe_by_article(raw, max_per_article=max_per_article)[:top_k]
+                if dataset_key == "suma":
+                    chunks = dedupe_by_article(raw, max_per_article=max_per_article)[:top_k]
+                else:
+                    chunks = dedupe_by_source(raw, max_per_doc=max_per_article)[:top_k]
 
                 history = [
                     {"role": m["role"], "content": m["content"]}
@@ -217,7 +261,10 @@ with main_col:
                 ]
 
                 try:
-                    result = answer(prompt, chunks, model=model, history=history)
+                    if dataset_key == "suma":
+                        result = answer(prompt, chunks, model=model, history=history)
+                    else:
+                        result = answer_tcc(prompt, chunks, model=model, history=history)
                 except KeyError as e:
                     st.error(f"Variável de ambiente faltando: {e}.")
                     st.stop()
@@ -243,11 +290,17 @@ with sources_col:
                 score_label = f"rrf={c.rrf_score:.4f}"
             else:
                 score_label = f"d={c.distance:.3f}"
-            with st.expander(f"{i}. {c.citacao} — {_short_secao(c.secao)}  ·  {score_label}"):
-                st.markdown(f"**Questão:** {c.titulo_questao}")
-                st.markdown(f"**Artigo:** {c.titulo_artigo}")
-                st.markdown("---")
-                st.markdown(c.text)
+            if isinstance(c, TccChunk):
+                with st.expander(f"{i}. {c.citacao} — {c.section}  ·  {score_label}"):
+                    st.markdown(f"**Título:** {c.titulo}")
+                    st.markdown("---")
+                    st.markdown(c.text)
+            else:
+                with st.expander(f"{i}. {c.citacao} — {_short_secao(c.secao)}  ·  {score_label}"):
+                    st.markdown(f"**Questão:** {c.titulo_questao}")
+                    st.markdown(f"**Artigo:** {c.titulo_artigo}")
+                    st.markdown("---")
+                    st.markdown(c.text)
 
     usage = st.session_state.get("last_usage")
     if usage:
