@@ -166,13 +166,20 @@ with st.sidebar:
                     st.session_state.messages = []
                 st.rerun()
 
+def _copy_button(content: str, key: str) -> None:
+    """Render a popover that exposes the raw markdown with a built-in copy button."""
+    with st.popover("📋 Copiar como markdown", use_container_width=False):
+        st.code(content, language="markdown")
+
+
 main_col, sources_col = st.columns([2, 1])
 
 with main_col:
-    for msg in st.session_state.messages:
+    for i, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
             if msg["role"] == "assistant":
                 st.markdown(_highlight_citations(msg["content"]))
+                _copy_button(msg["content"], key=f"copy_{i}")
             else:
                 st.markdown(msg["content"])
 
@@ -216,6 +223,7 @@ with main_col:
                     st.stop()
 
             st.markdown(_highlight_citations(result.text))
+            _copy_button(result.text, key=f"copy_new_{len(st.session_state.messages)}")
             sources = _chunks_to_dicts(chunks)
             st.session_state.messages.append({"role": "assistant", "content": result.text, "sources": sources})
             store.add_message(conv_id, "assistant", result.text, sources=sources)
